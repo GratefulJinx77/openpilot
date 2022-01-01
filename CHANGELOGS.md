@@ -1,6 +1,7 @@
 sunnypilot - Version 0.8.12-2
 ========================
-* ADDED: All FW versions and tuning for eps modded civic_bosch (#15) thansk to CFranYota!
+* IMPROVE: Update HKG car list in Force Car Recognition (#22) thanks to FrogAi!
+* ADDED: All FW versions and tuning for eps modded civic_bosch (#15) thanks to CFranYota!
 * NEW❗: Disable M.A.D.S. toggle to disable the beloved M.A.D.S. feature
   * Enable Stock openpilot engagement/disengagement
 * ADJUST: Initialize Driving Screen Off Brightness at 50%
