@@ -1,13 +1,18 @@
-from cereal import car
+from cereal import car, log
 from common.numpy_fast import clip, interp
+from common.realtime import DT_CTRL
 from selfdrive.car import apply_toyota_steer_torque_limits, create_gas_interceptor_command, make_can_msg
-from selfdrive.car.toyota.toyotacan import create_steer_command, create_ui_command, \
+from selfdrive.car.toyota.toyotacan import create_steer_command, create_ui_command, create_ui_command_off,\
                                            create_accel_command, create_acc_cancel_command, \
-                                           create_fcw_command, create_lta_steer_command
+                                           create_fcw_command, create_lta_steer_command, create_acc_spam_command
 from selfdrive.car.toyota.values import CAR, STATIC_DSU_MSGS, NO_STOP_TIMER_CAR, TSS2_CAR, \
-                                        MIN_ACC_SPEED, PEDAL_TRANSITION, CarControllerParams
+                                        MIN_ACC_SPEED, PEDAL_TRANSITION, CarControllerParams, CruiseButtons
 from opendbc.can.packer import CANPacker
+from selfdrive.config import Conversions as CV
+import cereal.messaging as messaging
+from common.params import Params
 VisualAlert = car.CarControl.HUDControl.VisualAlert
+SpeedLimitControlState = log.LongitudinalPlan.SpeedLimitControlState
 
 
 class CarController():
@@ -17,6 +22,17 @@ class CarController():
     self.last_standstill = False
     self.standstill_req = False
     self.steer_rate_limited = False
+    self.signal_last = 0.
+
+    self.sm = messaging.SubMaster(['liveMapData', 'longitudinalPlan'])
+    self.is_metric = Params().get_bool("IsMetric")
+    self.speed_limit_osm = 0.
+    self.speed_limit_offset_osm = 0.
+    self.speed_limit_change_applied = True
+    self.speed_limit_current = 0.
+    self.speed_limit_offsetted_prev = 0.
+    self.last_spam_resume_frame = 0
+    self.last_spam_set_frame = 0
 
     self.packer = CANPacker(dbc_name)
 
@@ -26,7 +42,7 @@ class CarController():
     # *** compute control surfaces ***
 
     # gas and brake
-    if CS.CP.enableGasInterceptor and enabled:
+    if CS.CP.enableGasInterceptor and enabled and CS.out.cruiseState.enabled:
       MAX_INTERCEPTOR_GAS = 0.5
       # RAV4 has very sensitive gas pedal
       if CS.CP.carFingerprint in [CAR.RAV4, CAR.RAV4H, CAR.HIGHLANDER, CAR.HIGHLANDERH]:
@@ -41,24 +57,29 @@ class CarController():
       interceptor_gas_cmd = clip(pedal_command, 0., MAX_INTERCEPTOR_GAS)
     else:
       interceptor_gas_cmd = 0.
-    pcm_accel_cmd = clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX)
+    pcm_accel_cmd = 0 if not (enabled and CS.out.cruiseState.enabled) else clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX)
 
     # steer torque
     new_steer = int(round(actuators.steer * CarControllerParams.STEER_MAX))
     apply_steer = apply_toyota_steer_torque_limits(new_steer, self.last_steer, CS.out.steeringTorqueEps, CarControllerParams)
-    self.steer_rate_limited = new_steer != apply_steer
+    self.steer_rate_limited = False
+
+    cur_time = frame * DT_CTRL
+    if CS.leftBlinkerOn or CS.rightBlinkerOn:
+      self.signal_last = cur_time
 
     # Cut steering while we're in a known fault state (2s)
-    if not enabled or CS.steer_state in [9, 25]:
+    if enabled and not CS.steer_not_allowed and CS.lkasEnabled and ((CS.automaticLaneChange and not CS.belowLaneChangeSpeed) or ((not ((cur_time - self.signal_last) < 1) or not CS.belowLaneChangeSpeed) and not (CS.leftBlinkerOn or CS.rightBlinkerOn))):
+      self.steer_rate_limited = new_steer != apply_steer
+      apply_steer_req = 1
+    else:
       apply_steer = 0
       apply_steer_req = 0
-    else:
-      apply_steer_req = 1
 
     # TODO: probably can delete this. CS.pcm_acc_status uses a different signal
     # than CS.cruiseState.enabled. confirm they're not meaningfully different
-    if not enabled and CS.pcm_acc_status:
-      pcm_cancel_cmd = 1
+    #if not enabled and CS.pcm_acc_status:
+      #pcm_cancel_cmd = 1
 
     # on entering standstill, send standstill request
     if CS.out.standstill and not self.last_standstill and CS.CP.carFingerprint not in NO_STOP_TIMER_CAR:
@@ -87,6 +108,8 @@ class CarController():
     #   can_sends.append(create_steer_command(self.packer, 0, 0, frame // 2))
     #   can_sends.append(create_lta_steer_command(self.packer, actuators.steeringAngleDeg, apply_steer_req, frame // 2))
 
+    stock_long_speed_limit_control_enabled = True
+
     # we can spam can to cancel the system even if we are using lat only control
     if (frame % 3 == 0 and CS.CP.openpilotLongitudinalControl) or pcm_cancel_cmd:
       lead = lead or CS.out.vEgo < 12.    # at low speed we always assume the lead is present do ACC can be engaged
@@ -98,6 +121,38 @@ class CarController():
         can_sends.append(create_accel_command(self.packer, pcm_accel_cmd, pcm_cancel_cmd, self.standstill_req, lead, CS.acc_type))
       else:
         can_sends.append(create_accel_command(self.packer, 0, pcm_cancel_cmd, False, lead, CS.acc_type))
+        if stock_long_speed_limit_control_enabled:
+          self.speed_limit_change_applied = False
+
+    if CS.out.brakePressed or CS.out.gasPressed or CS.out.cruiseButtons == 0:
+      if stock_long_speed_limit_control_enabled:
+        self.speed_limit_change_applied = False
+
+    if CS.out.standstill:
+      if stock_long_speed_limit_control_enabled:
+        self.speed_limit_change_applied = False
+
+    if self.get_speed_limit_osm() != self.speed_limit_current:
+      if stock_long_speed_limit_control_enabled:
+        self.speed_limit_change_applied = False
+    self.speed_limit_current = self.get_speed_limit_osm()
+    speed_limit_offsetted_new = int(self.speed_limit_current + self.get_speed_limit_offset_osm())
+
+    if not CS.CP.openpilotLongitudinalControl:
+      if CS.out.cruiseState.enabled and not self.speed_limit_change_applied and not pcm_cancel_cmd and not CS.out.cruiseState.standstill:
+        set_speed_current = int(float(CS.out.cruiseState.speed) * (CV.MS_TO_MPH if not self.is_metric else CV.MS_TO_KPH))
+        speed_diff = int(speed_limit_offsetted_new - set_speed_current)
+
+        if speed_diff > 0:
+          if (frame - self.last_spam_resume_frame) * DT_CTRL > 0.1:
+            can_sends.append([create_acc_spam_command(self.packer, CruiseButtons.ACCEL_ACC)])
+            self.last_spam_resume_frame = frame
+        else:
+          if (frame - self.last_spam_set_frame) * DT_CTRL > 0.1:
+            can_sends.extend([create_acc_spam_command(self.packer, CruiseButtons.DECEL_ACC)])
+            self.last_spam_set_frame = frame
+        if speed_diff == 0:
+          self.speed_limit_change_applied = True
 
     if frame % 2 == 0 and CS.CP.enableGasInterceptor:
       # send exactly zero if gas cmd is zero. Interceptor will send the max between read value and gas cmd.
@@ -120,7 +175,10 @@ class CarController():
       send_ui = True
 
     if (frame % 100 == 0 or send_ui):
-      can_sends.append(create_ui_command(self.packer, steer_alert, pcm_cancel_cmd, left_line, right_line, left_lane_depart, right_lane_depart))
+      if(CS.lkasEnabled):
+        can_sends.append(create_ui_command(self.packer, steer_alert, pcm_cancel_cmd, left_line, right_line, left_lane_depart, right_lane_depart, CS.lkasEnabled and not apply_steer_req))
+      else:
+        can_sends.append(create_ui_command_off(self.packer))
 
     if frame % 100 == 0 and CS.CP.enableDsu:
       can_sends.append(create_fcw_command(self.packer, fcw_alert))
@@ -132,3 +190,13 @@ class CarController():
         can_sends.append(make_can_msg(addr, vl, bus))
 
     return can_sends
+
+  def get_speed_limit_osm(self):
+    self.sm.update(0)
+    self.speed_limit_osm = float(self.sm['longitudinalPlan'].speedLimit if self.sm['longitudinalPlan'].speedLimit is not None else 0.0) * (CV.MS_TO_MPH if not self.is_metric else CV.MS_TO_KPH)
+    return self.speed_limit_osm
+
+  def get_speed_limit_offset_osm(self):
+    self.sm.update(0)
+    self.speed_limit_offset_osm = float(self.sm['longitudinalPlan'].speedLimitOffset) * (CV.MS_TO_MPH if not self.is_metric else CV.MS_TO_KPH)
+    return self.speed_limit_offset_osm
