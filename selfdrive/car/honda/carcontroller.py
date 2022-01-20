@@ -7,6 +7,10 @@ from selfdrive.car import create_gas_interceptor_command
 from selfdrive.car.honda import hondacan
 from selfdrive.car.honda.values import CruiseButtons, VISUAL_HUD, HONDA_BOSCH, HONDA_NIDEC_ALT_PCM_ACCEL, CarControllerParams
 from opendbc.can.packer import CANPacker
+from selfdrive.config import Conversions as CV
+import cereal.messaging as messaging
+from selfdrive.controls.lib.speed_limit_controller import SpeedLimitController
+from common.params import Params
 
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
@@ -93,7 +97,7 @@ def process_hud_alert(hud_alert):
 
 HUDData = namedtuple("HUDData",
                      ["pcm_accel", "v_cruise", "car",
-                     "lanes", "fcw", "acc_alert", "steer_required"])
+                     "lanes", "fcw", "acc_alert", "steer_required", "dashed_lanes"])
 
 
 class CarController():
@@ -101,11 +105,19 @@ class CarController():
     self.braking = False
     self.brake_steady = 0.
     self.brake_last = 0.
+    self.signal_last = 0.
     self.apply_brake_last = 0
     self.last_pump_ts = 0.
     self.packer = CANPacker(dbc_name)
 
     self.params = CarControllerParams(CP)
+
+    self.sm = messaging.SubMaster(['longitudinalPlan', 'liveMapData'])
+    self.speed_limit_controller = SpeedLimitController()
+    self.speed_limit_current = 0.0
+    self.speed_limit_new_osm = 0.0
+    self.speed_limit_offset_osm = 0.0
+    self.speed_limit_change_applied = True
 
   def update(self, enabled, active, CS, frame, actuators, pcm_cancel_cmd,
              hud_v_cruise, hud_show_lanes, hud_show_car, hud_alert):
@@ -125,13 +137,7 @@ class CarController():
     # *** rate limit after the enable check ***
     self.brake_last = rate_limit(pre_limit_brake, self.brake_last, -2., DT_CTRL)
 
-    # vehicle hud display, wait for one update from 10Hz 0x304 msg
-    if hud_show_lanes:
-      hud_lanes = 1
-    else:
-      hud_lanes = 0
-
-    if enabled:
+    if enabled and CS.out.cruiseState.enabled:
       if hud_show_car:
         hud_car = 2
       else:
@@ -141,13 +147,19 @@ class CarController():
 
     fcw_display, steer_required, acc_alert = process_hud_alert(hud_alert)
 
+    cur_time = frame * DT_CTRL
+    if (CS.leftBlinkerOn or CS.rightBlinkerOn):
+      self.signal_last = cur_time
+
+    lkas_active = enabled and not CS.steer_not_allowed and CS.lkasEnabled and\
+                  ((CS.automaticLaneChange and not CS.belowLaneChangeSpeed) or
+                  ((not ((cur_time - self.signal_last) < 1) or not CS.belowLaneChangeSpeed) and not
+                  (CS.leftBlinkerOn or CS.rightBlinkerOn)))
 
     # **** process the car messages ****
 
     # steer torque is converted back to CAN reference (positive when steering right)
     apply_steer = int(interp(-actuators.steer * P.STEER_MAX, P.STEER_LOOKUP_BP, P.STEER_LOOKUP_V))
-
-    lkas_active = enabled and not CS.steer_not_allowed
 
     # Send CAN commands.
     can_sends = []
@@ -194,15 +206,42 @@ class CarController():
       pcm_speed = interp(gas-brake, pcm_speed_BP, pcm_speed_V)
       pcm_accel = int(clip((accel/1.44)/max_accel, 0.0, 1.0) * 0xc6)
 
+    stock_long_speed_limit_control_enabled = Params().get_bool("StockLongSpeedLimitControl")
+
+    if self.get_speed_limit_new_osm(CS) != self.speed_limit_current:
+      if stock_long_speed_limit_control_enabled:
+        self.speed_limit_change_applied = False
+    self.speed_limit_current = self.get_speed_limit_new_osm(CS)
+    speed_limit_offsetted = int(self.speed_limit_current + self.get_speed_limit_offset_osm(CS))
+
     if not CS.CP.openpilotLongitudinalControl:
       if (frame % 2) == 0:
         idx = frame // 2
         can_sends.append(hondacan.create_bosch_supplemental_1(self.packer, CS.CP.carFingerprint, idx))
+      if CS.out.cruiseState.enabled and not self.speed_limit_change_applied and not pcm_cancel_cmd and not CS.out.cruiseState.standstill:
+        set_speed_current = int(float(CS.out.cruiseState.speed) * CV.MS_TO_MPH if not CS.is_metric else CV.MS_TO_KPH)
+        speed_diff = int(speed_limit_offsetted - set_speed_current)
+
+        if speed_diff > 0:
+          can_sends.append([hondacan.spam_buttons_command(self.packer, CruiseButtons.RES_ACCEL, idx, CS.CP.carFingerprint)])
+        else:
+          can_sends.append([hondacan.spam_buttons_command(self.packer, CruiseButtons.DECEL_SET, idx, CS.CP.carFingerprint)])
+        if speed_diff == 0:
+          self.speed_limit_change_applied = True
+
+      if CS.out.brakePressed or CS.out.gasPressed or CS.out.cruiseButtons == 2:
+        if stock_long_speed_limit_control_enabled:
+          self.speed_limit_change_applied = False
+
       # If using stock ACC, spam cancel command to kill gas when OP disengages.
       if pcm_cancel_cmd:
         can_sends.append(hondacan.spam_buttons_command(self.packer, CruiseButtons.CANCEL, idx, CS.CP.carFingerprint))
+        if stock_long_speed_limit_control_enabled:
+          self.speed_limit_change_applied = False
       elif CS.out.cruiseState.standstill:
         can_sends.append(hondacan.spam_buttons_command(self.packer, CruiseButtons.RES_ACCEL, idx, CS.CP.carFingerprint))
+        if stock_long_speed_limit_control_enabled:
+          self.speed_limit_change_applied = False
 
     else:
       # Send gas and brake commands.
@@ -213,11 +252,16 @@ class CarController():
         if CS.CP.carFingerprint in HONDA_BOSCH:
           accel = clip(accel, P.BOSCH_ACCEL_MIN, P.BOSCH_ACCEL_MAX)
           bosch_gas = interp(accel, P.BOSCH_GAS_LOOKUP_BP, P.BOSCH_GAS_LOOKUP_V)
+          if not CS.out.cruiseState.enabled:
+            bosch_gas = 0.
           can_sends.extend(hondacan.create_acc_commands(self.packer, enabled, active, accel, bosch_gas, idx, stopping, starting, CS.CP.carFingerprint))
 
         else:
           apply_brake = clip(self.brake_last - wind_brake, 0.0, 1.0)
           apply_brake = int(clip(apply_brake * P.NIDEC_BRAKE_MAX, 0, P.NIDEC_BRAKE_MAX - 1))
+          if not CS.out.cruiseState.enabled and not (CS.CP.pcmCruise and CS.accEnabled and CS.CP.minEnableSpeed > 0 and not CS.out.cruiseState.enabled):
+            apply_brake = 0.
+            bosch_gas = 0.
           pump_on, self.last_pump_ts = brake_pump_hysteresis(apply_brake, self.apply_brake_last, self.last_pump_ts, ts)
 
           pcm_override = True
@@ -232,14 +276,14 @@ class CarController():
             # This prevents unexpected pedal range rescaling
             # Sending non-zero gas when OP is not enabled will cause the PCM not to respond to throttle as expected
             # when you do enable.
-            if active:
+            if active and CS.out.cruiseState.enabled:
               apply_gas = clip(gas_mult * (gas - brake + wind_brake*3/4), 0., 1.)
             else:
               apply_gas = 0.0
             can_sends.append(create_gas_interceptor_command(self.packer, apply_gas, idx))
 
-    hud = HUDData(int(pcm_accel), int(round(hud_v_cruise)), hud_car,
-                  hud_lanes, fcw_display, acc_alert, steer_required)
+    hud = HUDData(int(pcm_accel), int(round(hud_v_cruise)) if hud_car != 0 else 255, hud_car,
+                  hud_show_lanes and lkas_active, fcw_display, acc_alert, steer_required, CS.lkasEnabled and not lkas_active)
 
     # Send dashboard UI commands.
     if (frame % 10) == 0:
@@ -247,3 +291,13 @@ class CarController():
       can_sends.extend(hondacan.create_ui_commands(self.packer, CS.CP, pcm_speed, hud, CS.is_metric, idx, CS.stock_hud))
 
     return can_sends
+
+  def get_speed_limit_new_osm(self, CS):
+    self.sm.update(0)
+    self.speed_limit_new_osm = float(self.sm['longitudinalPlan'].speedLimit) * CV.MS_TO_MPH if not CS.is_metric else CV.MS_TO_KPH
+    return self.speed_limit_new_osm
+
+  def get_speed_limit_offset_osm(self, CS):
+    self.sm.update(0)
+    self.speed_limit_offset_osm = float(self.sm['longitudinalPlan'].speedLimitOffset) * CV.MS_TO_MPH if not CS.is_metric else CV.MS_TO_KPH
+    return self.speed_limit_offset_osm
