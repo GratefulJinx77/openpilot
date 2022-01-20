@@ -214,23 +214,23 @@ class CarController():
       if stock_long_speed_limit_control_enabled:
         self.speed_limit_change_applied = False
     self.speed_limit_current = self.get_speed_limit_new_osm(CS)
-    speed_limit_zero = True if self.speed_limit_current == 0 else False
+    #speed_limit_zero = True if self.speed_limit_current == 0 else False
     speed_limit_offsetted = int(self.speed_limit_current + self.get_speed_limit_offset_osm(CS))
 
     if not CS.CP.openpilotLongitudinalControl:
       if (frame % 2) == 0:
         idx = frame // 2
         can_sends.append(hondacan.create_bosch_supplemental_1(self.packer, CS.CP.carFingerprint, idx))
-      if CS.out.cruiseState.enabled and not self.speed_limit_change_applied and not pcm_cancel_cmd and not CS.out.cruiseState.standstill and not speed_limit_zero:
+      if CS.out.cruiseState.enabled and not self.speed_limit_change_applied and not pcm_cancel_cmd and not CS.out.cruiseState.standstill:
         set_speed_current = int(float(CS.out.cruiseState.speed) * CV.MS_TO_MPH if not CS.is_metric else CV.MS_TO_KPH)
         speed_diff = int(speed_limit_offsetted - set_speed_current)
 
         if speed_diff > 0:
-          if (frame - self.last_spam_resume_frame) * DT_CTRL > 0.2:
+          if (frame - self.last_spam_resume_frame) * DT_CTRL > 0.1:
             can_sends.extend([hondacan.spam_buttons_command(self.packer, CruiseButtons.RES_ACCEL, idx, CS.CP.carFingerprint)])
             self.last_spam_resume_frame = frame
         else:
-          if (frame - self.last_spam_set_frame) * DT_CTRL > 0.2:
+          if (frame - self.last_spam_set_frame) * DT_CTRL > 0.1:
             can_sends.extend([hondacan.spam_buttons_command(self.packer, CruiseButtons.DECEL_SET, idx, CS.CP.carFingerprint)])
             self.last_spam_set_frame = frame
         if speed_diff == 0:
