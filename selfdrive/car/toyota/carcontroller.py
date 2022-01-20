@@ -145,7 +145,7 @@ class CarController():
 
         if speed_diff > 0:
           if (frame - self.last_spam_resume_frame) * DT_CTRL > 0.1:
-            can_sends.append([create_acc_spam_command(self.packer, CruiseButtons.ACCEL_ACC)])
+            can_sends.extend([create_acc_spam_command(self.packer, CruiseButtons.ACCEL_ACC)])
             self.last_spam_resume_frame = frame
         else:
           if (frame - self.last_spam_set_frame) * DT_CTRL > 0.1:
