@@ -226,11 +226,11 @@ class CarController():
         speed_diff = int(speed_limit_offsetted - set_speed_current)
 
         if speed_diff > 0:
-          if (frame - self.last_spam_resume_frame) * DT_CTRL > 1.25:
+          if (frame - self.last_spam_resume_frame) * DT_CTRL > 0.2:
             can_sends.extend([hondacan.spam_buttons_command(self.packer, CruiseButtons.RES_ACCEL, idx, CS.CP.carFingerprint)])
             self.last_spam_resume_frame = frame
         else:
-          if (frame - self.last_spam_set_frame) * DT_CTRL > 1.25:
+          if (frame - self.last_spam_set_frame) * DT_CTRL > 0.2:
             can_sends.extend([hondacan.spam_buttons_command(self.packer, CruiseButtons.DECEL_SET, idx, CS.CP.carFingerprint)])
             self.last_spam_set_frame = frame
         if speed_diff == 0:
