@@ -5,6 +5,7 @@ hyundai_checksum = crcmod.mkCrcFun(0x11D, initCrc=0xFD, rev=False, xorOut=0xdf)
 
 def create_lkas11(packer, frame, car_fingerprint, apply_steer, steer_req,
                   lkas11, sys_warning, sys_state, enabled,
+                  lkas_active, disengage_from_brakes, below_lane_change_speed, disengage_blinking_icon,
                   left_lane, right_lane,
                   left_lane_depart, right_lane_depart):
   values = lkas11
@@ -29,7 +30,8 @@ def create_lkas11(packer, frame, car_fingerprint, apply_steer, steer_req,
     # FcwOpt_USM 2 = Green car + lanes
     # FcwOpt_USM 1 = White car + lanes
     # FcwOpt_USM 0 = No car + lanes
-    values["CF_Lkas_FcwOpt_USM"] = 2 if enabled else 1
+    values["CF_Lkas_FcwOpt_USM"] = 2 if lkas_active else 2 if disengage_blinking_icon else 1 if\
+                                   (disengage_from_brakes or below_lane_change_speed) else 1
 
     # SysWarning 4 = keep hands on wheel
     # SysWarning 5 = keep hands on wheel (red)
@@ -69,22 +71,31 @@ def create_clu11(packer, frame, clu11, button):
   return packer.make_can_msg("CLU11", 0, values)
 
 
-def create_lfahda_mfc(packer, enabled, hda_set_speed=0):
+def create_lfahda_mfc(packer, enabled, lkas_active, disengage_from_brakes, below_lane_change_speed, disengage_blinking_icon,
+                      speed_limit_offsetted, slc_active, switching_to_hda, set_speed, speed_limit_changed, speed_limit_offsetted_new, speed_calc, slc_applied, hda_set_speed=0):
   values = {
-    "LFA_Icon_State": 2 if enabled else 0,
-    "HDA_Active": 1 if hda_set_speed else 0,
-    "HDA_Icon_State": 2 if hda_set_speed else 0,
-    "HDA_VSetReq": hda_set_speed,
+    "LFA_Icon_State": 2 if lkas_active else 3 if disengage_blinking_icon else 1 if (disengage_from_brakes or below_lane_change_speed) else 0,
+    #"HDA_Active": 1 if hda_set_speed else 0,
+    #"HDA_Icon_State": 2 if hda_set_speed else 0,
+    #"HDA_VSetReq": hda_set_speed,
+    #"HDA_Active": 1 if (speed_limit_offsetted > 0.0) or (speed_limit_offsetted_new > 0.0) else 0, # 1 AUTO (icon) == HDA_VSetReq (highway limit speed), 0 HDA (icon)
+    "HDA_Active": 1,
+    #"HDA_Active": 1 if slc_active and enabled else 0, # test mode
+    "HDA_Icon_State": 2 if slc_active and enabled else 1 if not slc_active and (speed_limit_offsetted > 0.0) or (speed_limit_offsetted_new > 0.0) else 0,
+    #"HDA_Icon_State": 2 if slc_active else 1, # test mode
+    "HDA_VSetReq": speed_limit_offsetted if speed_limit_offsetted > 0.0 and slc_active else speed_limit_offsetted_new if speed_limit_offsetted_new > 0.0 and slc_active else set_speed,
+    "HDA_Chime": 1 if speed_limit_changed and slc_active and enabled else 0,
+    "LFA_SysWarning": 1 if switching_to_hda else 0
   }
   return packer.make_can_msg("LFAHDA_MFC", 0, values)
 
-def create_acc_commands(packer, enabled, accel, jerk, idx, lead_visible, set_speed, stopping):
+def create_acc_commands(packer, enabled, accel, jerk, idx, lead_visible, set_speed, speed_limit_offsetted, slc_active, stopping):
   commands = []
 
   scc11_values = {
     "MainMode_ACC": 1,
     "TauGapSet": 4,
-    "VSetDis": set_speed if enabled else 0,
+    "VSetDis": speed_limit_offsetted if (speed_limit_offsetted > 0.0) and slc_active else set_speed,
     "AliveCounterACC": idx % 0x10,
     "ObjValid": 1 if lead_visible else 0,
     "ACC_ObjStatus": 1 if lead_visible else 0,
